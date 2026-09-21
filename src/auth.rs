@@ -32,6 +32,21 @@ fn detect_auth_mode(credentials: &serde_json::Value) -> Result<AuthMode> {
     ))
 }
 
+/// Reject empty or whitespace-only credential/token strings.
+/// `as_str()` happily returns Some("") and `yup_oauth2` can surface empty
+/// access tokens; either would otherwise travel downstream and fail far
+/// from the root cause. (moiria: hardening for upstream Issue #14)
+fn require_non_empty<'a>(value: &'a str, field: &str) -> Result<&'a str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(McpGoogleAdsError::Auth(format!(
+            "{} is empty or whitespace-only",
+            field
+        )));
+    }
+    Ok(trimmed)
+}
+
 /// Get an access token for the Google Ads API.
 ///
 /// Supports two modes:
@@ -86,6 +101,7 @@ async fn get_service_account_token(credentials_path: &std::path::Path) -> Result
         .token()
         .map(|t| t.to_string())
         .ok_or_else(|| McpGoogleAdsError::Auth("Service account token was empty".to_string()))
+        .and_then(|t| require_non_empty(&t, "service account access token").map(|s| s.to_string()))
 }
 
 async fn get_authorized_user_token(
@@ -96,95 +112,100 @@ async fn get_authorized_user_token(
     // Format: {"installed": {"client_id": "...", "client_secret": "..."}} or
     //         {"web": {"client_id": "...", "client_secret": "..."}} or
     //         {"type": "authorized_user", "client_id": "...", "client_secret": "...", "refresh_token": "..."}
-    let (client_id, client_secret, refresh_token) =
-        if let Some(t) = credentials_json.get("type").and_then(|v| v.as_str()) {
-            if t == "authorized_user" {
-                // Direct authorized_user format (e.g., from gcloud)
-                let client_id = credentials_json
-                    .get("client_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        McpGoogleAdsError::Auth(
-                            "Missing client_id in authorized_user credentials".to_string(),
-                        )
-                    })?;
-                let client_secret = credentials_json
-                    .get("client_secret")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        McpGoogleAdsError::Auth(
-                            "Missing client_secret in authorized_user credentials".to_string(),
-                        )
-                    })?;
-                let refresh_token = credentials_json
-                    .get("refresh_token")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        McpGoogleAdsError::Auth(
-                            "Missing refresh_token in authorized_user credentials".to_string(),
-                        )
-                    })?;
-                (
-                    client_id.to_string(),
-                    client_secret.to_string(),
-                    refresh_token.to_string(),
-                )
-            } else {
-                return Err(McpGoogleAdsError::Auth(format!(
-                    "Unexpected credential type: {}",
-                    t
-                )));
-            }
-        } else {
-            // OAuth2 installed/web app format
-            let app_config = credentials_json
-                .get("installed")
-                .or_else(|| credentials_json.get("web"))
-                .ok_or_else(|| {
-                    McpGoogleAdsError::Auth(
-                        "Credentials file missing 'installed' or 'web' section".to_string(),
-                    )
-                })?;
-
-            let client_id = app_config
+    let (client_id, client_secret, refresh_token) = if let Some(t) =
+        credentials_json.get("type").and_then(|v| v.as_str())
+    {
+        if t == "authorized_user" {
+            // Direct authorized_user format (e.g., from gcloud)
+            let client_id = credentials_json
                 .get("client_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    McpGoogleAdsError::Auth("Missing client_id in credentials".to_string())
-                })?;
-            let client_secret = app_config
+                    McpGoogleAdsError::Auth(
+                        "Missing client_id in authorized_user credentials".to_string(),
+                    )
+                })
+                .and_then(|v| require_non_empty(v, "client_id"))?;
+            let client_secret = credentials_json
                 .get("client_secret")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    McpGoogleAdsError::Auth("Missing client_secret in credentials".to_string())
-                })?;
-
-            // Read refresh_token from token.json
-            let token_path = &config.google.token_path;
-            if !token_path.exists() {
-                return Err(McpGoogleAdsError::Auth(format!(
-                    "Token file not found: {}. Run the auth flow first to obtain a refresh token.",
-                    token_path.display()
-                )));
-            }
-
-            let token_bytes = tokio::fs::read(token_path).await.map_err(|e| {
-                McpGoogleAdsError::Auth(format!("Failed to read token file: {}", e))
-            })?;
-            let token_json: serde_json::Value = serde_json::from_slice(&token_bytes)?;
-            let refresh_token = token_json
+                    McpGoogleAdsError::Auth(
+                        "Missing client_secret in authorized_user credentials".to_string(),
+                    )
+                })
+                .and_then(|v| require_non_empty(v, "client_secret"))?;
+            let refresh_token = credentials_json
                 .get("refresh_token")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    McpGoogleAdsError::Auth("Missing refresh_token in token file".to_string())
-                })?;
-
+                    McpGoogleAdsError::Auth(
+                        "Missing refresh_token in authorized_user credentials".to_string(),
+                    )
+                })
+                .and_then(|v| require_non_empty(v, "refresh_token"))?;
             (
                 client_id.to_string(),
                 client_secret.to_string(),
                 refresh_token.to_string(),
             )
-        };
+        } else {
+            return Err(McpGoogleAdsError::Auth(format!(
+                "Unexpected credential type: {}",
+                t
+            )));
+        }
+    } else {
+        // OAuth2 installed/web app format
+        let app_config = credentials_json
+            .get("installed")
+            .or_else(|| credentials_json.get("web"))
+            .ok_or_else(|| {
+                McpGoogleAdsError::Auth(
+                    "Credentials file missing 'installed' or 'web' section".to_string(),
+                )
+            })?;
+
+        let client_id = app_config
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| McpGoogleAdsError::Auth("Missing client_id in credentials".to_string()))
+            .and_then(|v| require_non_empty(v, "client_id"))?;
+        let client_secret = app_config
+            .get("client_secret")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                McpGoogleAdsError::Auth("Missing client_secret in credentials".to_string())
+            })
+            .and_then(|v| require_non_empty(v, "client_secret"))?;
+
+        // Read refresh_token from token.json
+        let token_path = &config.google.token_path;
+        if !token_path.exists() {
+            return Err(McpGoogleAdsError::Auth(format!(
+                "Token file not found: {}. Run the auth flow first to obtain a refresh token.",
+                token_path.display()
+            )));
+        }
+
+        let token_bytes = tokio::fs::read(token_path)
+            .await
+            .map_err(|e| McpGoogleAdsError::Auth(format!("Failed to read token file: {}", e)))?;
+        let token_json: serde_json::Value = serde_json::from_slice(&token_bytes)?;
+        let refresh_token = token_json
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                McpGoogleAdsError::Auth("Missing refresh_token in token file".to_string())
+            })
+            .and_then(|v| require_non_empty(v, "refresh_token"))?;
+
+        (
+            client_id.to_string(),
+            client_secret.to_string(),
+            refresh_token.to_string(),
+        )
+    };
 
     let secret = yup_oauth2::authorized_user::AuthorizedUserSecret {
         client_id,
@@ -212,12 +233,20 @@ async fn get_authorized_user_token(
         .token()
         .map(|t| t.to_string())
         .ok_or_else(|| McpGoogleAdsError::Auth("OAuth2 token was empty".to_string()))
+        .and_then(|t| require_non_empty(&t, "OAuth2 access token").map(|s| s.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_require_non_empty_rejects_empty_and_whitespace() {
+        assert!(require_non_empty("", "field").is_err());
+        assert!(require_non_empty("   \n\t", "field").is_err());
+        assert_eq!(require_non_empty(" ok ", "field").unwrap(), "ok");
+    }
 
     #[test]
     fn test_detect_service_account() {
