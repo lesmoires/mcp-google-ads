@@ -77,6 +77,10 @@ pub struct SafetyConfig {
     pub require_dry_run: bool,
     pub log_file: PathBuf,
     pub blocked_operations: Vec<String>,
+    /// Directory backing the pending/applied plan store. Point this at a
+    /// shared mount so drafted plans survive a container restart, not just
+    /// the per-call process spawn.
+    pub plan_store_dir: PathBuf,
 }
 
 impl Default for SafetyConfig {
@@ -87,6 +91,7 @@ impl Default for SafetyConfig {
             require_dry_run: true,
             log_file: expand_tilde("~/.mcp-google-ads/audit.log"),
             blocked_operations: Vec::new(),
+            plan_store_dir: expand_tilde("~/.mcp-google-ads/plans"),
         }
     }
 }
@@ -115,6 +120,7 @@ impl Config {
     /// | `GOOGLE_ADS_REQUIRE_DRY_RUN` | `true` |
     /// | `GOOGLE_ADS_AUDIT_LOG` | `~/.mcp-google-ads/audit.log` |
     /// | `GOOGLE_ADS_BLOCKED_OPS` | (empty, comma-separated) |
+    /// | `GOOGLE_ADS_PLAN_STORE_DIR` | `~/.mcp-google-ads/plans` |
     /// | `GOOGLE_ADS_READ_ONLY` | `false` |
     pub fn load() -> Result<Self> {
         let login_customer_id = std::env::var("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
@@ -140,6 +146,10 @@ impl Config {
                 require_dry_run: env_bool_or("GOOGLE_ADS_REQUIRE_DRY_RUN", true),
                 log_file: env_path_or("GOOGLE_ADS_AUDIT_LOG", "~/.mcp-google-ads/audit.log"),
                 blocked_operations: env_list("GOOGLE_ADS_BLOCKED_OPS"),
+                plan_store_dir: env_path_or(
+                    "GOOGLE_ADS_PLAN_STORE_DIR",
+                    "~/.mcp-google-ads/plans",
+                ),
             },
             read_only: env_bool_or("GOOGLE_ADS_READ_ONLY", false),
         })
@@ -211,11 +221,12 @@ mod tests {
         std::env::remove_var("GOOGLE_ADS_MAX_BID_INCREASE_PCT");
         std::env::remove_var("GOOGLE_ADS_REQUIRE_DRY_RUN");
         std::env::remove_var("GOOGLE_ADS_BLOCKED_OPS");
+        std::env::remove_var("GOOGLE_ADS_PLAN_STORE_DIR");
 
         let config = Config::load().unwrap();
         assert_eq!(config.ads.developer_token, "");
         assert_eq!(config.ads.customer_id, "");
-        assert!(config.ads.login_customer_id.is_none());
+        assert_eq!(config.ads.login_customer_id, None);
         assert_eq!(config.safety.max_daily_budget, 50.0);
         assert_eq!(config.safety.max_bid_increase_pct, 100);
         assert!(config.safety.require_dry_run);
@@ -247,7 +258,7 @@ mod tests {
         assert!(!config.safety.require_dry_run);
         assert_eq!(
             config.safety.blocked_operations,
-            vec!["delete_campaign", "remove_entity"]
+            vec!["delete_campaign".to_string(), "remove_entity".to_string()]
         );
         assert_eq!(
             config.google.credentials_path,
@@ -267,6 +278,28 @@ mod tests {
         std::env::remove_var("GOOGLE_ADS_CREDENTIALS_PATH");
         std::env::remove_var("GOOGLE_ADS_TOKEN_PATH");
         std::env::remove_var("GOOGLE_ADS_AUDIT_LOG");
+    }
+
+    #[test]
+    fn test_plan_store_dir_defaults_and_env_override() {
+        std::env::remove_var("GOOGLE_ADS_PLAN_STORE_DIR");
+        let config = Config::load().unwrap();
+        assert!(
+            config
+                .safety
+                .plan_store_dir
+                .to_string_lossy()
+                .contains(".mcp-google-ads"),
+            "default plan store dir should live under ~/.mcp-google-ads"
+        );
+
+        std::env::set_var("GOOGLE_ADS_PLAN_STORE_DIR", "/tmp/gads-plans-test");
+        let config = Config::load().unwrap();
+        assert_eq!(
+            config.safety.plan_store_dir,
+            PathBuf::from("/tmp/gads-plans-test")
+        );
+        std::env::remove_var("GOOGLE_ADS_PLAN_STORE_DIR");
     }
 
     #[test]
@@ -298,7 +331,7 @@ mod tests {
     fn test_login_customer_id_empty_string() {
         std::env::set_var("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "");
         let config = Config::load().unwrap();
-        assert!(config.ads.login_customer_id.is_none());
+        assert_eq!(config.ads.login_customer_id, None);
         std::env::remove_var("GOOGLE_ADS_LOGIN_CUSTOMER_ID");
     }
 }
