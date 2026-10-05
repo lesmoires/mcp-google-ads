@@ -4,7 +4,9 @@ use crate::client::{GoogleAdsClient, MutateOperation};
 use crate::config::Config;
 use crate::error::{McpGoogleAdsError, Result};
 use crate::safety::audit;
-use crate::safety::preview::{claim_plan, finalize_plan, get_claimed_plan, get_plan, ChangePlan, PlanDispatch};
+use crate::safety::preview::{
+    claim_plan, finalize_plan, get_claimed_plan, get_plan, restore_plan, ChangePlan, PlanDispatch,
+};
 
 /// Parameters carried through `confirm_and_apply` callers down to the apply
 /// implementation. Centralised so the hard guards (`require_dry_run`,
@@ -198,7 +200,7 @@ async fn apply_plan(
                 error: &e.to_string(),
             });
             // Release the claim so the caller can retry.
-            restore_plan(plan, plan_id);
+            restore_plan(plan);
             Err(e)
         }
     }
@@ -274,9 +276,11 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    /// Thread-scoped store dir so these tests stay isolated from each other
+    /// and from the other modules' tests running in the same process.
     fn use_temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mcp-gads-confirm-{}-{}", tag, Uuid::new_v4()));
-        crate::safety::preview::init_plan_store(dir.clone());
+        crate::safety::preview::init_plan_store_for_test(dir.clone());
         dir
     }
 

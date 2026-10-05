@@ -221,12 +221,11 @@ mod tests {
         std::env::remove_var("GOOGLE_ADS_MAX_BID_INCREASE_PCT");
         std::env::remove_var("GOOGLE_ADS_REQUIRE_DRY_RUN");
         std::env::remove_var("GOOGLE_ADS_BLOCKED_OPS");
-        std::env::remove_var("GOOGLE_ADS_PLAN_STORE_DIR");
 
         let config = Config::load().unwrap();
         assert_eq!(config.ads.developer_token, "");
         assert_eq!(config.ads.customer_id, "");
-        assert_eq!(config.ads.login_customer_id, None);
+        assert!(config.ads.login_customer_id.is_none());
         assert_eq!(config.safety.max_daily_budget, 50.0);
         assert_eq!(config.safety.max_bid_increase_pct, 100);
         assert!(config.safety.require_dry_run);
@@ -258,7 +257,7 @@ mod tests {
         assert!(!config.safety.require_dry_run);
         assert_eq!(
             config.safety.blocked_operations,
-            vec!["delete_campaign".to_string(), "remove_entity".to_string()]
+            vec!["delete_campaign", "remove_entity"]
         );
         assert_eq!(
             config.google.credentials_path,
@@ -285,11 +284,7 @@ mod tests {
         std::env::remove_var("GOOGLE_ADS_PLAN_STORE_DIR");
         let config = Config::load().unwrap();
         assert!(
-            config
-                .safety
-                .plan_store_dir
-                .to_string_lossy()
-                .contains(".mcp-google-ads"),
+            config.safety.plan_store_dir.to_string_lossy().contains(".mcp-google-ads"),
             "default plan store dir should live under ~/.mcp-google-ads"
         );
 
@@ -331,7 +326,7 @@ mod tests {
     fn test_login_customer_id_empty_string() {
         std::env::set_var("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "");
         let config = Config::load().unwrap();
-        assert_eq!(config.ads.login_customer_id, None);
+        assert!(config.ads.login_customer_id.is_none());
         std::env::remove_var("GOOGLE_ADS_LOGIN_CUSTOMER_ID");
     }
 }

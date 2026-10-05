@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -166,10 +165,17 @@ impl ChangePlan {
 /// expired and removed on read.
 const DEFAULT_PLAN_TTL_SECS: i64 = 15 * 60;
 
-/// Process-local cache of the configured store directory. Set once per process
-/// by `store_plan`/`get_plan` from `Config`; falls back to the default path so
-/// existing unit tests and direct library use keep working unchanged.
+/// Directory configured at server boot (from `Config`), or `None` for the
+/// default location. Set exactly once per process; there is no reason for it to
+/// change while the server runs.
 static PLAN_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Per-thread override used by tests so each test gets an isolated directory
+/// without disturbing other tests running concurrently in the same process.
+/// Production code never sets this, so runtime behaviour is unaffected.
+thread_local! {
+    static PLAN_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
 
 fn default_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
@@ -179,6 +185,9 @@ fn default_dir() -> PathBuf {
 }
 
 fn store_root() -> PathBuf {
+    if let Some(dir) = PLAN_DIR_OVERRIDE.with(|o| o.borrow().clone()) {
+        return dir;
+    }
     let guard = PLAN_DIR.lock().expect("plan dir lock poisoned");
     match guard.as_ref() {
         Some(p) => p.clone(),
@@ -191,6 +200,19 @@ fn store_root() -> PathBuf {
 pub fn init_plan_store(dir: PathBuf) {
     let mut guard = PLAN_DIR.lock().expect("plan dir lock poisoned");
     *guard = Some(dir);
+}
+
+#[cfg(test)]
+fn set_plan_store_override(dir: PathBuf) {
+    PLAN_DIR_OVERRIDE.with(|o| *o.borrow_mut() = Some(dir));
+}
+
+/// Test-only entry point so sibling modules' `#[cfg(test)]` code can point the
+/// plan store at an isolated directory without touching the process-global
+/// boot configuration.
+#[cfg(test)]
+pub fn init_plan_store_for_test(dir: PathBuf) {
+    set_plan_store_override(dir);
 }
 
 fn pending_dir() -> PathBuf {
@@ -234,14 +256,13 @@ fn read_plan_file(path: &Path) -> Option<ChangePlan> {
 }
 
 fn is_expired(plan: &ChangePlan, ttl_secs: i64) -> bool {
-    chrono::DateTime::parse_from_rfc3339(&plan.created_at)
-        .map(|created| {
-            Utc::now()
-                .signed_duration_since(created)
-                .map(|d| d.num_seconds() > ttl_secs)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(&plan.created_at) else {
+        // Unparsable timestamp: treat as expired rather than immortal.
+        return true;
+    };
+    // `signed_duration_since` returns a plain TimeDelta in this chrono
+    // version: negative values mean the plan is timestamped in the future.
+    Utc::now().signed_duration_since(created).num_seconds() > ttl_secs
 }
 
 /// Persist a freshly drafted plan.
@@ -316,6 +337,20 @@ pub fn claim_plan(plan_id: &str) -> Option<ChangePlan> {
     read_plan_file(&applied_dir().join(format!("{}.json", plan_id)))
 }
 
+/// Release a claimed plan back to `pending/` after a failed apply, so the
+/// caller can retry it. Writes the plan back atomically, then clears the
+/// applied record.
+pub fn restore_plan(plan: &ChangePlan) {
+    if !plan_id_is_safe(&plan.plan_id) {
+        return;
+    }
+    let Ok(raw) = serde_json::to_string(plan) else {
+        return;
+    };
+    let _ = write_atomic(&pending_dir().join(format!("{}.json", plan.plan_id)), &raw);
+    let _ = std::fs::remove_file(applied_dir().join(format!("{}.json", plan.plan_id)));
+}
+
 /// Retrieve an already-claimed plan record, if any.
 pub fn get_claimed_plan(plan_id: &str) -> Option<AppliedRecord> {
     if !plan_id_is_safe(plan_id) {
@@ -346,6 +381,11 @@ pub fn finalize_plan(plan_id: &str, result: &serde_json::Value) {
     let Some(plan) = read_plan_file(&path) else {
         return;
     };
+    // Prune FIRST: pruning reads applied/ files back as bare ChangePlans, so
+    // running it after the write would mis-parse the record we just stored and
+    // delete it as "unreadable".
+    prune_applied_excluding(plan_id);
+
     let record = AppliedRecord {
         plan,
         result: result.clone(),
@@ -353,10 +393,11 @@ pub fn finalize_plan(plan_id: &str, result: &serde_json::Value) {
     if let Ok(raw) = serde_json::to_string(&record) {
         let _ = write_atomic(&path, &raw);
     }
-    prune_applied();
 }
 
-fn prune_applied() {
+/// Drop applied records older than the TTL so the store stays bounded.
+/// `keep` protects a record we are about to rewrite (see `finalize_plan`).
+fn prune_applied_excluding(keep: &str) {
     let Ok(entries) = std::fs::read_dir(applied_dir()) else {
         return;
     };
@@ -366,13 +407,28 @@ fn prune_applied() {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let expired = read_plan_file(&path)
-            .map(|p| is_expired(&p, ttl))
-            .unwrap_or(true);
-        if expired {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if stem == keep {
+            continue;
+        }
+        // An applied/ file may hold either a bare ChangePlan (crashed apply) or
+        // an AppliedRecord. Only delete on confirmed expiry, never on a parse
+        // failure — an unrecognised record may be the only evidence of what
+        // happened, so leave it for an operator to inspect.
+        let created_at = read_created_at(&path);
+        if created_at.map(|c| is_expired(&c, ttl)).unwrap_or(false) {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// Extract `created_at` from either serialisation (bare ChangePlan or AppliedRecord).
+fn read_created_at(path: &Path) -> Option<ChangePlan> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    if let Ok(rec) = serde_json::from_str::<AppliedRecord>(&raw) {
+        return Some(rec.plan);
+    }
+    serde_json::from_str::<ChangePlan>(&raw).ok()
 }
 
 #[cfg(test)]
@@ -391,11 +447,13 @@ mod tests {
         )
     }
 
-    /// Point every test at its own temp dir so they never touch `~/.mcp-google-ads`
-    /// and can run in parallel.
+    /// Point the test at its own temp dir so it never touches
+    /// `~/.mcp-google-ads`. Scoped to this thread, so tests stay isolated even
+    /// when the harness runs them in parallel.
     fn use_temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mcp-gads-plans-{}-{}", tag, uuid::Uuid::new_v4()));
-        init_plan_store(dir.clone());
+        let dir =
+            std::env::temp_dir().join(format!("mcp-gads-plans-{}-{}", tag, uuid::Uuid::new_v4()));
+        set_plan_store_override(dir.clone());
         dir
     }
 
@@ -456,9 +514,9 @@ mod tests {
         let plan_id = plan.plan_id.clone();
         store_plan(plan);
         assert!(dir.join("pending").join(format!("{}.json", plan_id)).exists());
-        // Re-read without any in-process memory: drop the cached dir handle and
-        // rebuild it the way a freshly spawned server would.
-        init_plan_store(dir.clone());
+        // Drop any cached handle and re-resolve the directory from scratch,
+        // the way a freshly spawned server process would.
+        set_plan_store_override(dir.clone());
         assert!(get_plan(&plan_id).is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -514,6 +572,26 @@ mod tests {
             claim_plan(&plan_id).is_none(),
             "a second claim must fail — this is what makes double-apply impossible"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_restore_plan_makes_failed_apply_retryable() {
+        // Failed applies must release the claim so the documented
+        // "plan is kept so the user can retry" contract still holds.
+        let dir = use_temp_dir("restore");
+        let plan = make_plan();
+        let plan_id = plan.plan_id.clone();
+        store_plan(plan);
+
+        let claimed = claim_plan(&plan_id).expect("claim");
+        assert!(get_plan(&plan_id).is_none(), "claimed plans are not pending");
+
+        restore_plan(&claimed);
+
+        let recovered = get_plan(&plan_id).expect("plan must be retryable again");
+        assert_eq!(recovered.plan_id, plan_id);
+        assert!(get_claimed_plan(&plan_id).is_none(), "release must clear the applied record");
         let _ = std::fs::remove_dir_all(dir);
     }
 
