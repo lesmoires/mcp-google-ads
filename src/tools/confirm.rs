@@ -6,7 +6,8 @@ use crate::error::{McpGoogleAdsError, Result};
 use crate::safety::audit;
 use crate::safety::policy_exemption;
 use crate::safety::preview::{
-    claim_plan, finalize_plan, get_claimed_plan, get_plan, restore_plan, ChangePlan, PlanDispatch,
+    claim_plan, finalize_plan, get_claimed_plan, get_plan, remove_plan, restore_plan, ChangePlan,
+    PlanDispatch,
 };
 
 /// Parameters carried through `confirm_and_apply` callers down to the apply
