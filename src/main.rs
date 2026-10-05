@@ -16,6 +16,14 @@ async fn main() -> Result<()> {
     tracing::info!("Starting MCP Google Ads server");
 
     let config = Config::load()?;
+    // Point the plan store at the configured directory before serving. Plans
+    // are stored on disk so a drafted plan survives the process exit that the
+    // stdio transport performs after every tool call.
+    mcp_google_ads::safety::preview::init_plan_store(config.safety.plan_store_dir.clone());
+    tracing::info!(
+        "Plan store directory: {}",
+        config.safety.plan_store_dir.to_string_lossy()
+    );
     let server = mcp_google_ads::GoogleAdsMcp::new(config)?;
 
     let transport = rmcp::transport::io::stdio();

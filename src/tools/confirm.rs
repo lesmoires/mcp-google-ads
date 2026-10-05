@@ -5,7 +5,9 @@ use crate::config::Config;
 use crate::error::{McpGoogleAdsError, Result};
 use crate::safety::audit;
 use crate::safety::policy_exemption;
-use crate::safety::preview::{get_plan, remove_plan, ChangePlan, PlanDispatch};
+use crate::safety::preview::{
+    claim_plan, finalize_plan, get_claimed_plan, get_plan, restore_plan, ChangePlan, PlanDispatch,
+};
 
 /// Parameters carried through `confirm_and_apply` callers down to the apply
 /// implementation. Centralised so the hard guards (`require_dry_run`,
@@ -60,6 +62,24 @@ pub async fn confirm_and_apply(
         exempt_policy_violations,
     } = input;
 
+    // Already applied? Replay the recorded result rather than failing with
+    // PlanNotFound. This is what makes confirm idempotent across the
+    // process-per-call stdio transport: a retried or duplicated confirm can
+    // never issue a second mutate (i.e. never double-spend a client budget).
+    if let Some(record) = get_claimed_plan(&plan_id) {
+        if let Some(obj) = record.result.as_object() {
+            let mut replay = obj.clone();
+            replay.insert("idempotent_replay".to_string(), json!(true));
+            replay.insert("plan_id".to_string(), json!(plan_id));
+            return Ok(serde_json::Value::Object(replay));
+        }
+        // Claimed but no result recorded: the previous apply crashed before
+        // completing. Report it explicitly instead of silently mutating again.
+        return Err(McpGoogleAdsError::PlanNotFound(format!(
+            "Plan '{plan_id}' was claimed by an earlier confirm that did not complete (no recorded result). It has NOT been re-applied. Inspect the plan store before retrying."
+        )));
+    }
+
     let plan = get_plan(&plan_id).ok_or_else(|| {
         McpGoogleAdsError::PlanNotFound(format!(
             "No pending plan found with ID '{}'. It may have already been applied or expired.",
@@ -94,8 +114,31 @@ pub async fn confirm_and_apply(
         return Err(McpGoogleAdsError::DoubleConfirmRequired);
     }
 
+    // Claim the plan BEFORE any HTTP traffic: atomic rename out of pending/.
+    // Exactly one concurrent confirm can win; the loser replays.
+    let Some(claimed) = claim_plan(&plan_id) else {
+        if let Some(record) = get_claimed_plan(&plan_id) {
+            if let Some(obj) = record.result.as_object() {
+                let mut replay = obj.clone();
+                replay.insert("idempotent_replay".to_string(), json!(true));
+                replay.insert("plan_id".to_string(), json!(plan_id));
+                return Ok(serde_json::Value::Object(replay));
+            }
+        }
+        return Err(McpGoogleAdsError::PlanNotFound(format!(
+            "Plan '{plan_id}' could not be claimed for apply. Another confirm may be in progress."
+        )));
+    };
+
     let client = GoogleAdsClient::new(config)?;
-    apply_plan(&client, config, &plan, &plan_id, exempt_policy_violations).await
+    apply_plan(
+        &client,
+        config,
+        &claimed,
+        &plan_id,
+        exempt_policy_violations,
+    )
+    .await
 }
 
 /// Dispatch the plan to the correct Google Ads RPC and shape the response.
@@ -152,7 +195,9 @@ async fn apply_plan(
                 }
             }
 
-            remove_plan(plan_id);
+            // Record the result against the claimed plan so any repeat confirm
+            // replays instead of mutating again.
+            finalize_plan(plan_id, &result);
             Ok(result)
         }
         Err(e) => {
@@ -167,7 +212,8 @@ async fn apply_plan(
                 result: "FAILED",
                 error: &e.to_string(),
             });
-            // Keep the plan in the store so the user can retry.
+            // Release the claim so the caller can retry (documented contract).
+            restore_plan(plan);
             Err(e)
         }
     }
