@@ -4,7 +4,9 @@ use crate::client::{GoogleAdsClient, MutateOperation};
 use crate::config::Config;
 use crate::error::{McpGoogleAdsError, Result};
 use crate::safety::audit;
-use crate::safety::preview::{get_plan, remove_plan, ChangePlan, PlanDispatch};
+use crate::safety::preview::{
+    claim_plan, finalize_plan, get_claimed_plan, get_plan, restore_plan, ChangePlan, PlanDispatch,
+};
 
 /// Parameters carried through `confirm_and_apply` callers down to the apply
 /// implementation. Centralised so the hard guards (`require_dry_run`,
@@ -36,10 +38,16 @@ pub struct ConfirmApplyInput {
 /// - `plan.requires_double_confirm && !confirmed_twice && !dry_run`
 ///   -> [`McpGoogleAdsError::DoubleConfirmRequired`]
 ///
-/// On success the plan is removed from the store and the mutation result
-/// is logged to the audit file. On failure the plan is kept so the caller
-/// can retry. Successful responses NEVER include a warning — the warning
-/// emitted by v0.2.x was removed (it was cosmetic and lied about safety).
+/// On success the applied plan and its result are recorded, and the mutation
+/// is logged to the audit file. On failure the plan is returned to `pending/`
+/// so the caller can retry. Successful responses NEVER include a warning — the
+/// warning emitted by v0.2.x was removed (it was cosmetic and lied about safety).
+///
+/// Idempotency: the plan is claimed (atomically renamed out of `pending/`)
+/// before any HTTP traffic. A repeated `confirm_and_apply` for an
+/// already-applied plan replays the recorded result instead of mutating again,
+/// so a retried confirm — or a duplicated tool call from a confused agent —
+/// can never double-spend a client budget.
 pub async fn confirm_and_apply(
     config: &Config,
     input: ConfirmApplyInput,
@@ -51,9 +59,26 @@ pub async fn confirm_and_apply(
         confirmed_twice,
     } = input;
 
+    // Already applied? Replay the recorded result rather than failing with
+    // PlanNotFound. This is what makes confirm idempotent across the
+    // process-per-call stdio transport.
+    if let Some(record) = get_claimed_plan(&plan_id) {
+        if let Some(result) = record.result.as_object() {
+            let mut replay = result.clone();
+            replay.insert("idempotent_replay".to_string(), json!(true));
+            replay.insert("plan_id".to_string(), json!(plan_id));
+            return Ok(serde_json::Value::Object(replay));
+        }
+        // Claimed but no result recorded: the previous apply crashed before
+        // completing. Surface it explicitly instead of silently mutating again.
+        return Err(McpGoogleAdsError::PlanNotFound(format!(
+            "Plan '{plan_id}' was claimed by an earlier confirm that did not complete (no recorded result). It has NOT been re-applied. Inspect the plan store before retrying."
+        )));
+    }
+
     let plan = get_plan(&plan_id).ok_or_else(|| {
         McpGoogleAdsError::PlanNotFound(format!(
-            "No pending plan found with ID '{}'. It may have already been applied or expired.",
+            "No pending plan found with ID \'{}\'. It may have already been applied or expired.",
             plan_id
         ))
     })?;
@@ -84,6 +109,24 @@ pub async fn confirm_and_apply(
     if plan.requires_double_confirm && !confirmed_twice {
         return Err(McpGoogleAdsError::DoubleConfirmRequired);
     }
+
+    // Claim the plan BEFORE any HTTP traffic: atomic rename out of pending/.
+    // Exactly one concurrent confirm can win; the loser replays from the
+    // recorded result instead of issuing a second mutate.
+    let Some(plan) = claim_plan(&plan_id) else {
+        // Lost the race — another confirm claimed it first.
+        if let Some(record) = get_claimed_plan(&plan_id) {
+            if let Some(result) = record.result.as_object() {
+                let mut replay = result.clone();
+                replay.insert("idempotent_replay".to_string(), json!(true));
+                replay.insert("plan_id".to_string(), json!(plan_id));
+                return Ok(serde_json::Value::Object(replay));
+            }
+        }
+        return Err(McpGoogleAdsError::PlanNotFound(format!(
+            "Plan '{plan_id}' could not be claimed for apply. Another confirm may be in progress."
+        )));
+    };
 
     let client = GoogleAdsClient::new(config)?;
     apply_plan(&client, config, &plan, &plan_id).await
@@ -139,7 +182,9 @@ async fn apply_plan(
                 }
             }
 
-            remove_plan(plan_id);
+            // Record the result against the claimed plan so any repeat confirm
+            // replays instead of mutating again.
+            finalize_plan(plan_id, &result);
             Ok(result)
         }
         Err(e) => {
@@ -154,7 +199,8 @@ async fn apply_plan(
                 result: "FAILED",
                 error: &e.to_string(),
             });
-            // Keep the plan in the store so the user can retry.
+            // Release the claim so the caller can retry.
+            restore_plan(plan);
             Err(e)
         }
     }
@@ -227,6 +273,16 @@ async fn dismiss_recommendation_dispatch(
 mod tests {
     use super::*;
     use crate::safety::preview::{get_plan, store_plan, ChangePlan};
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    /// Thread-scoped store dir so these tests stay isolated from each other
+    /// and from the other modules' tests running in the same process.
+    fn use_temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mcp-gads-confirm-{}-{}", tag, Uuid::new_v4()));
+        crate::safety::preview::init_plan_store_for_test(dir.clone());
+        dir
+    }
 
     #[test]
     fn test_plan_not_found_via_get() {
@@ -237,6 +293,7 @@ mod tests {
 
     #[test]
     fn test_plan_store_and_retrieve() {
+        let dir = use_temp_dir("store_retrieve");
         let plan = ChangePlan::new(
             "test_op".to_string(),
             "campaign".to_string(),
@@ -254,12 +311,14 @@ mod tests {
         assert!(retrieved.is_some());
         let retrieved = retrieved.map(|p| p.operation).unwrap_or_default();
         assert_eq!(retrieved, "test_op");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn test_require_dry_run_hard_guards_apply() {
         // Plan exists, require_dry_run=true (default), dry_run=false, no bypass.
         // Expected: Err(DryRunRequired) BEFORE any HTTP call.
+        let dir = use_temp_dir("dry_run_guard");
         let plan = ChangePlan::new(
             "test_op".to_string(),
             "campaign".to_string(),
@@ -290,11 +349,12 @@ mod tests {
         assert!(matches!(err, McpGoogleAdsError::DryRunRequired));
         // Plan is preserved so the caller can retry.
         assert!(get_plan(&plan_id).is_some());
-        remove_plan(&plan_id);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn test_dry_run_returns_preview_without_http() {
+        let dir = use_temp_dir("dry_run_preview");
         let plan = ChangePlan::new(
             "test_op".to_string(),
             "campaign".to_string(),
@@ -322,6 +382,87 @@ mod tests {
         assert_eq!(preview["dry_run"], true);
         // Plan is preserved across dry runs.
         assert!(get_plan(&plan_id).is_some());
-        remove_plan(&plan_id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_replays_recorded_result_instead_of_mutating_twice() {
+        // The idempotency contract: once a plan has been applied and recorded,
+        // a repeated confirm returns the recorded result (flagged
+        // idempotent_replay) and never re-enters the dispatch path.
+        let dir = use_temp_dir("idempotent_replay");
+        let plan = ChangePlan::new(
+            "test_op".to_string(),
+            "campaign".to_string(),
+            "1".to_string(),
+            "1234567890".to_string(),
+            serde_json::json!({}),
+            false,
+            vec![serde_json::json!({"campaignOperation": {"update": {"resourceName": "x"}}})],
+        );
+        let plan_id = plan.plan_id.clone();
+
+        // Simulate a completed apply: claim + record the result.
+        store_plan(plan);
+        let claimed = crate::safety::preview::claim_plan(&plan_id).expect("claim");
+        assert_eq!(claimed.plan_id, plan_id);
+        finalize_plan(&plan_id, &json!({"status": "APPLIED", "responses": []}));
+
+        let config = Config::default();
+        let replay = confirm_and_apply(
+            &config,
+            ConfirmApplyInput {
+                plan_id: plan_id.clone(),
+                dry_run: false,
+                bypass_require_dry_run: true,
+                confirmed_twice: true,
+            },
+        )
+        .await
+        .expect("replay should succeed without HTTP");
+
+        assert_eq!(replay["status"], "APPLIED");
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["plan_id"], plan_id.as_str());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_claim_is_reported_not_reapplied() {
+        // A crash between claim and finalize must NOT silently re-apply.
+        let dir = use_temp_dir("incomplete_claim");
+        let plan = ChangePlan::new(
+            "test_op".to_string(),
+            "campaign".to_string(),
+            "1".to_string(),
+            "1234567890".to_string(),
+            serde_json::json!({}),
+            false,
+            vec![serde_json::json!({"campaignOperation": {"update": {"resourceName": "x"}}})],
+        );
+        let plan_id = plan.plan_id.clone();
+        store_plan(plan);
+        crate::safety::preview::claim_plan(&plan_id).expect("claim");
+        // Deliberately no finalize_plan() — simulates a crashed apply.
+
+        let config = Config::default();
+        let err = confirm_and_apply(
+            &config,
+            ConfirmApplyInput {
+                plan_id: plan_id.clone(),
+                dry_run: false,
+                bypass_require_dry_run: true,
+                confirmed_twice: true,
+            },
+        )
+        .await
+        .expect_err("must not re-apply an incomplete claim");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not complete"),
+            "unexpected error: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
