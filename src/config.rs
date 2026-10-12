@@ -122,7 +122,10 @@ impl SafetyConfig {
     /// was refused instead of a bare boolean.
     pub fn customer_allowed(&self, customer_id: &str) -> (bool, String) {
         if self.allowed_customer_ids.is_empty() {
-            return (true, "GOOGLE_ADS_ALLOWED_CIDS not set (unrestricted)".to_string());
+            return (
+                true,
+                "GOOGLE_ADS_ALLOWED_CIDS not set (unrestricted)".to_string(),
+            );
         }
 
         let requested = normalize_customer_id(customer_id);
@@ -133,7 +136,7 @@ impl SafetyConfig {
             );
         }
 
-        if self.allowed_customer_ids.iter().any(|a| *a == requested) {
+        if self.allowed_customer_ids.contains(&requested) {
             return (true, format!("customer_id {requested} is allow-listed"));
         }
 
@@ -207,10 +210,7 @@ impl Config {
                 require_dry_run: env_bool_or("GOOGLE_ADS_REQUIRE_DRY_RUN", true),
                 log_file: env_path_or("GOOGLE_ADS_AUDIT_LOG", "~/.mcp-google-ads/audit.log"),
                 blocked_operations: env_list("GOOGLE_ADS_BLOCKED_OPS"),
-                plan_store_dir: env_path_or(
-                    "GOOGLE_ADS_PLAN_STORE_DIR",
-                    "~/.mcp-google-ads/plans",
-                ),
+                plan_store_dir: env_path_or("GOOGLE_ADS_PLAN_STORE_DIR", "~/.mcp-google-ads/plans"),
                 allowed_customer_ids,
             },
             read_only: env_bool_or("GOOGLE_ADS_READ_ONLY", false),
@@ -368,7 +368,10 @@ mod tests {
     fn test_allow_list_skips_non_numeric_entries() {
         std::env::set_var("GOOGLE_ADS_ALLOWED_CIDS", "849-615-2956, garbage");
         let config = Config::load().unwrap();
-        assert_eq!(config.safety.allowed_customer_ids, vec!["8496152956".to_string()]);
+        assert_eq!(
+            config.safety.allowed_customer_ids,
+            vec!["8496152956".to_string()]
+        );
         std::env::remove_var("GOOGLE_ADS_ALLOWED_CIDS");
     }
 
@@ -445,7 +448,11 @@ mod tests {
         std::env::remove_var("GOOGLE_ADS_PLAN_STORE_DIR");
         let config = Config::load().unwrap();
         assert!(
-            config.safety.plan_store_dir.to_string_lossy().contains(".mcp-google-ads"),
+            config
+                .safety
+                .plan_store_dir
+                .to_string_lossy()
+                .contains(".mcp-google-ads"),
             "default plan store dir should live under ~/.mcp-google-ads"
         );
 

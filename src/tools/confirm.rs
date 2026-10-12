@@ -84,8 +84,7 @@ pub async fn confirm_and_apply(
 
     let plan = get_plan(&plan_id).ok_or_else(|| {
         McpGoogleAdsError::PlanNotFound(format!(
-            "No pending plan found with ID '{plan_id}'. It may have already been applied or expired.",
-            plan_id
+            "No pending plan found with ID '{plan_id}'. It may have already been applied or expired."
         ))
     })?;
 
@@ -494,10 +493,7 @@ mod tests {
         .expect_err("must not re-apply an incomplete claim");
 
         let msg = err.to_string();
-        assert!(
-            msg.contains("did not complete"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("did not complete"), "unexpected error: {msg}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -529,10 +525,7 @@ mod tests {
         .expect_err("out-of-scope plan must be refused");
 
         let msg = err.to_string();
-        assert!(
-            msg.contains("out-of-scope"),
-            "error should say why: {msg}"
-        );
+        assert!(msg.contains("out-of-scope"), "error should say why: {msg}");
         assert!(
             msg.contains("2147121846"),
             "error should name the offending CID: {msg}"
@@ -622,7 +615,7 @@ mod tests {
         let config = Config::default();
         assert!(config.safety.allowed_customer_ids.is_empty());
 
-        let err = confirm_and_apply(
+        let result = confirm_and_apply(
             &config,
             ConfirmApplyInput {
                 plan_id: plan_id.clone(),
@@ -632,11 +625,13 @@ mod tests {
             },
         )
         .await
-        .expect_err("no allow-list configured, so the dry-run path must be reachable");
+        .expect("an unset allow-list must not refuse anything — the dry run should succeed");
 
+        assert_eq!(result["dry_run"], true);
+        assert_eq!(result["customer_id"], "214-712-1846");
         assert!(
-            !err.to_string().contains("out-of-scope"),
-            "an unset allow-list must not refuse anything: {err}"
+            get_plan(&plan_id).is_some(),
+            "the dry run must leave the plan pending"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
