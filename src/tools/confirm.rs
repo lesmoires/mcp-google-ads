@@ -37,6 +37,8 @@ pub struct ConfirmApplyInput {
 ///   -> [`McpGoogleAdsError::DryRunRequired`]
 /// - `plan.requires_double_confirm && !confirmed_twice && !dry_run`
 ///   -> [`McpGoogleAdsError::DoubleConfirmRequired`]
+/// - `!config.safety.customer_allowed(&plan.customer_id)`
+///   -> [`McpGoogleAdsError::Safety`]
 ///
 /// On success the applied plan and its result are recorded, and the mutation
 /// is logged to the audit file. On failure the plan is returned to `pending/`
@@ -62,6 +64,10 @@ pub async fn confirm_and_apply(
     // Already applied? Replay the recorded result rather than failing with
     // PlanNotFound. This is what makes confirm idempotent across the
     // process-per-call stdio transport.
+    //
+    // This path deliberately runs BEFORE the customer_id allow-list check
+    // below: replaying a recorded result performs no write, so narrowing the
+    // allow-list afterwards must not break the idempotency contract.
     if let Some(record) = get_claimed_plan(&plan_id) {
         if let Some(result) = record.result.as_object() {
             let mut replay = result.clone();
@@ -78,10 +84,26 @@ pub async fn confirm_and_apply(
 
     let plan = get_plan(&plan_id).ok_or_else(|| {
         McpGoogleAdsError::PlanNotFound(format!(
-            "No pending plan found with ID \'{}\'. It may have already been applied or expired.",
-            plan_id
+            "No pending plan found with ID '{plan_id}'. It may have already been applied or expired."
         ))
     })?;
+
+    // Guard: the plan must target an account this server is allowed to write.
+    //
+    // Checked HERE, against `plan.customer_id`, and not only at draft time.
+    // `confirm_and_apply` takes no `customer_id` argument — the target comes
+    // from the persisted plan — so a guard keyed on the tool parameter would
+    // never run here, which is precisely where the write happens. Plans also
+    // outlive the process that drafted them, so the allow-list in force at
+    // draft time may differ from the one in force now. This is the decisive
+    // moment: everything above this line is read-only, everything below it
+    // issues the mutate.
+    let (allowed, reason) = config.safety.customer_allowed(&plan.customer_id);
+    if !allowed {
+        return Err(McpGoogleAdsError::Safety(format!(
+            "Plan '{plan_id}' targets an out-of-scope account: {reason}"
+        )));
+    }
 
     // Dry run: return preview without executing.
     if dry_run {
@@ -284,6 +306,18 @@ mod tests {
         dir
     }
 
+    fn plan_for(cid: &str) -> ChangePlan {
+        ChangePlan::new(
+            "test_op".to_string(),
+            "campaign".to_string(),
+            "1".to_string(),
+            cid.to_string(),
+            serde_json::json!({}),
+            false,
+            vec![serde_json::json!({"campaignOperation": {"update": {"resourceName": "x"}}})],
+        )
+    }
+
     #[test]
     fn test_plan_not_found_via_get() {
         // Attempting to get a non-existent plan returns None
@@ -459,10 +493,178 @@ mod tests {
         .expect_err("must not re-apply an incomplete claim");
 
         let msg = err.to_string();
+        assert!(msg.contains("did not complete"), "unexpected error: {msg}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── customer_id allow-list (fix B3) ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_apply_refuses_plan_targeting_out_of_scope_account() {
+        // The regression this guard exists for: a plan drafted for an account
+        // outside GOOGLE_ADS_ALLOWED_CIDS must not reach the mutate, even when
+        // every other guard is satisfied (dry-run bypassed, confirmed twice).
+        let dir = use_temp_dir("cid_guard_refuse");
+        let plan = plan_for("214-712-1846");
+        let plan_id = plan.plan_id.clone();
+        store_plan(plan);
+
+        let mut config = Config::default();
+        config.safety.allowed_customer_ids = vec!["8496152956".to_string()];
+
+        let err = confirm_and_apply(
+            &config,
+            ConfirmApplyInput {
+                plan_id: plan_id.clone(),
+                dry_run: false,
+                bypass_require_dry_run: true,
+                confirmed_twice: true,
+            },
+        )
+        .await
+        .expect_err("out-of-scope plan must be refused");
+
+        let msg = err.to_string();
+        assert!(msg.contains("out-of-scope"), "error should say why: {msg}");
         assert!(
-            msg.contains("did not complete"),
-            "unexpected error: {msg}"
+            msg.contains("2147121846"),
+            "error should name the offending CID: {msg}"
         );
+        // The plan stays pending so it can be inspected or re-drafted once the
+        // operator widens the allow-list. It must NOT have been claimed.
+        assert!(
+            get_plan(&plan_id).is_some(),
+            "refused plan must remain pending, not claimed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_allow_list_matches_plan_cid_regardless_of_dashes() {
+        // The plan stores whatever the caller passed. Dashes must not decide
+        // whether a plan is in scope.
+        let dir = use_temp_dir("cid_guard_dashes");
+        let mut config = Config::default();
+        config.safety.allowed_customer_ids = vec!["8496152956".to_string()];
+
+        let plan = plan_for("849-615-2956");
+        let plan_id = plan.plan_id.clone();
+        store_plan(plan);
+
+        // Restricted enough that the CID guard is the only thing that could
+        // reject this, and unreachable past it: the dry-run requirement fires
+        // first, proving the CID guard let it through.
+        let err = confirm_and_apply(
+            &config,
+            ConfirmApplyInput {
+                plan_id: plan_id.clone(),
+                dry_run: false,
+                bypass_require_dry_run: false,
+                confirmed_twice: false,
+            },
+        )
+        .await
+        .expect_err("dry-run guard should fire for an in-scope CID");
+
+        assert!(
+            matches!(err, McpGoogleAdsError::DryRunRequired),
+            "in-scope CID must pass the allow-list and reach the dry-run guard, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_of_out_of_scope_plan_is_also_refused() {
+        // A dry run performs no write, so one could argue it should be allowed
+        // for observability. It is refused anyway: the preview echoes the plan
+        // body, and letting an out-of-scope account's details through the tool
+        // surface would leak exactly what the guard exists to contain.
+        let dir = use_temp_dir("cid_guard_dry_run");
+        let plan = plan_for("214-712-1846");
+        let plan_id = plan.plan_id.clone();
+        store_plan(plan);
+
+        let mut config = Config::default();
+        config.safety.allowed_customer_ids = vec!["8496152956".to_string()];
+
+        let err = confirm_and_apply(
+            &config,
+            ConfirmApplyInput {
+                plan_id: plan_id.clone(),
+                dry_run: true,
+                bypass_require_dry_run: false,
+                confirmed_twice: false,
+            },
+        )
+        .await
+        .expect_err("out-of-scope plan must be refused even on dry_run");
+
+        assert!(err.to_string().contains("out-of-scope"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_unrestricted_config_applies_normally() {
+        // With no allow-list configured the guard is inert — existing
+        // deployments must keep working unchanged.
+        let dir = use_temp_dir("cid_guard_unset");
+        let plan = plan_for("214-712-1846");
+        let plan_id = plan.plan_id.clone();
+        store_plan(plan);
+
+        let config = Config::default();
+        assert!(config.safety.allowed_customer_ids.is_empty());
+
+        let result = confirm_and_apply(
+            &config,
+            ConfirmApplyInput {
+                plan_id: plan_id.clone(),
+                dry_run: true,
+                bypass_require_dry_run: false,
+                confirmed_twice: false,
+            },
+        )
+        .await
+        .expect("an unset allow-list must not refuse anything — the dry run should succeed");
+
+        assert_eq!(result["dry_run"], true);
+        assert_eq!(result["customer_id"], "214-712-1846");
+        assert!(
+            get_plan(&plan_id).is_some(),
+            "the dry run must leave the plan pending"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_replay_survives_allow_list_narrowing() {
+        // Replaying a recorded result performs no write. Narrowing the
+        // allow-list afterwards must not turn an already-applied plan into a
+        // hard error, or a retried confirm would start failing.
+        let dir = use_temp_dir("cid_guard_replay");
+        let plan = plan_for("214-712-1846");
+        let plan_id = plan.plan_id.clone();
+        store_plan(plan);
+        crate::safety::preview::claim_plan(&plan_id).expect("claim");
+        finalize_plan(&plan_id, &json!({"status": "APPLIED", "responses": []}));
+
+        let mut config = Config::default();
+        config.safety.allowed_customer_ids = vec!["8496152956".to_string()];
+
+        let replay = confirm_and_apply(
+            &config,
+            ConfirmApplyInput {
+                plan_id: plan_id.clone(),
+                dry_run: false,
+                bypass_require_dry_run: true,
+                confirmed_twice: true,
+            },
+        )
+        .await
+        .expect("replay must still succeed with a narrowed allow-list");
+
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["status"], "APPLIED");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
