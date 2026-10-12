@@ -11,7 +11,7 @@ use crate::error::Result;
 fn expand_path(path: &str) -> PathBuf {
     if path.starts_with("~/") || path == "~" {
         if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2:]);
+            return home.join(&path[2..]);
         }
     }
     PathBuf::from(path)
