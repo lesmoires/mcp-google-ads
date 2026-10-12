@@ -48,6 +48,16 @@ fn env_list(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Normalise a Google Ads customer ID to its bare digits.
+///
+/// The API accepts `123-456-7890` in config/env and `1234567890` from callers
+/// (and vice versa). Comparing the raw strings would let a caller slip past an
+/// allow-list simply by changing the separator, so every comparison — and the
+/// allow-list itself — is done on digits only.
+pub fn normalize_customer_id(cid: &str) -> String {
+    cid.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct GoogleConfig {
     pub credentials_path: PathBuf,
@@ -77,6 +87,17 @@ pub struct SafetyConfig {
     pub require_dry_run: bool,
     pub log_file: PathBuf,
     pub blocked_operations: Vec<String>,
+    /// Directory backing the pending/applied plan store. Point this at a
+    /// shared mount so drafted plans survive a container restart, not just
+    /// the per-call process spawn.
+    pub plan_store_dir: PathBuf,
+    /// Customer IDs this server is permitted to read or write.
+    ///
+    /// Empty = unrestricted (the historical behaviour). This is deliberately
+    /// opt-in: an operator must enumerate the accounts in scope rather than
+    /// inherit "every account the token can reach" by default. Values are
+    /// stored normalised to bare digits — see [`normalize_customer_id`].
+    pub allowed_customer_ids: Vec<String>,
 }
 
 impl Default for SafetyConfig {
@@ -87,7 +108,46 @@ impl Default for SafetyConfig {
             require_dry_run: true,
             log_file: expand_tilde("~/.mcp-google-ads/audit.log"),
             blocked_operations: Vec::new(),
+            plan_store_dir: expand_tilde("~/.mcp-google-ads/plans"),
+            allowed_customer_ids: Vec::new(),
         }
+    }
+}
+
+impl SafetyConfig {
+    /// Is `customer_id` within the configured allow-list?
+    ///
+    /// An empty list means unrestricted — the guard is inert until an operator
+    /// opts in. Returns `(allowed, reason)` so callers can surface *why* a call
+    /// was refused instead of a bare boolean.
+    pub fn customer_allowed(&self, customer_id: &str) -> (bool, String) {
+        if self.allowed_customer_ids.is_empty() {
+            return (
+                true,
+                "GOOGLE_ADS_ALLOWED_CIDS not set (unrestricted)".to_string(),
+            );
+        }
+
+        let requested = normalize_customer_id(customer_id);
+        if requested.is_empty() {
+            return (
+                false,
+                "customer_id is empty or contains no digits; refusing".to_string(),
+            );
+        }
+
+        if self.allowed_customer_ids.contains(&requested) {
+            return (true, format!("customer_id {requested} is allow-listed"));
+        }
+
+        (
+            false,
+            format!(
+                "customer_id {requested} is not in GOOGLE_ADS_ALLOWED_CIDS \
+                 (allowed: {})",
+                self.allowed_customer_ids.join(", ")
+            ),
+        )
     }
 }
 
@@ -115,11 +175,21 @@ impl Config {
     /// | `GOOGLE_ADS_REQUIRE_DRY_RUN` | `true` |
     /// | `GOOGLE_ADS_AUDIT_LOG` | `~/.mcp-google-ads/audit.log` |
     /// | `GOOGLE_ADS_BLOCKED_OPS` | (empty, comma-separated) |
+    /// | `GOOGLE_ADS_PLAN_STORE_DIR` | `~/.mcp-google-ads/plans` |
+    /// | `GOOGLE_ADS_ALLOWED_CIDS` | (empty = unrestricted, comma-separated) |
     /// | `GOOGLE_ADS_READ_ONLY` | `false` |
     pub fn load() -> Result<Self> {
         let login_customer_id = std::env::var("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
             .ok()
             .filter(|v| !v.is_empty());
+
+        // Normalise at load time so every later comparison is a plain
+        // string equality on digits — no separator-dependent mismatches.
+        let allowed_customer_ids: Vec<String> = env_list("GOOGLE_ADS_ALLOWED_CIDS")
+            .iter()
+            .map(|c| normalize_customer_id(c))
+            .filter(|c| !c.is_empty())
+            .collect();
 
         Ok(Config {
             google: GoogleConfig {
@@ -140,6 +210,8 @@ impl Config {
                 require_dry_run: env_bool_or("GOOGLE_ADS_REQUIRE_DRY_RUN", true),
                 log_file: env_path_or("GOOGLE_ADS_AUDIT_LOG", "~/.mcp-google-ads/audit.log"),
                 blocked_operations: env_list("GOOGLE_ADS_BLOCKED_OPS"),
+                plan_store_dir: env_path_or("GOOGLE_ADS_PLAN_STORE_DIR", "~/.mcp-google-ads/plans"),
+                allowed_customer_ids,
             },
             read_only: env_bool_or("GOOGLE_ADS_READ_ONLY", false),
         })
@@ -157,6 +229,7 @@ mod tests {
         assert_eq!(config.safety.max_bid_increase_pct, 100);
         assert!(config.safety.require_dry_run);
         assert!(config.safety.blocked_operations.is_empty());
+        assert!(config.safety.allowed_customer_ids.is_empty());
     }
 
     #[test]
@@ -199,6 +272,107 @@ mod tests {
     fn test_env_list_empty() {
         let list = env_list("__MCP_TEST_NONEXISTENT_VAR__");
         assert!(list.is_empty());
+    }
+
+    // ── customer_id normalisation ──────────────────────────────────────
+
+    #[test]
+    fn test_normalize_strips_dashes() {
+        assert_eq!(normalize_customer_id("123-456-7890"), "1234567890");
+        assert_eq!(normalize_customer_id("1234567890"), "1234567890");
+    }
+
+    #[test]
+    fn test_normalize_strips_surrounding_whitespace() {
+        assert_eq!(normalize_customer_id("  849-615-2956 "), "8496152956");
+    }
+
+    #[test]
+    fn test_normalize_keeps_leading_zeros() {
+        // MCC-style ids can start with 0 — dropping them would widen the match.
+        assert_eq!(normalize_customer_id("0238-706-4043"), "02387064043");
+    }
+
+    #[test]
+    fn test_normalize_non_numeric_yields_empty() {
+        assert_eq!(normalize_customer_id("not-a-cid"), "");
+        assert_eq!(normalize_customer_id(""), "");
+    }
+
+    // ── allow-list behaviour ───────────────────────────────────────────
+
+    #[test]
+    fn test_empty_allow_list_is_unrestricted() {
+        let config = SafetyConfig::default();
+        let (allowed, _) = config.customer_allowed("999-999-9999");
+        assert!(allowed, "an unset allow-list must not block anything");
+    }
+
+    #[test]
+    fn test_allow_list_permits_member_regardless_of_dashes() {
+        let config = SafetyConfig {
+            allowed_customer_ids: vec!["8496152956".to_string()],
+            ..SafetyConfig::default()
+        };
+        assert!(config.customer_allowed("849-615-2956").0);
+        assert!(config.customer_allowed("8496152956").0);
+    }
+
+    #[test]
+    fn test_allow_list_rejects_non_member() {
+        let config = SafetyConfig {
+            allowed_customer_ids: vec!["8496152956".to_string()],
+            ..SafetyConfig::default()
+        };
+        let (allowed, reason) = config.customer_allowed("214-712-1846");
+        assert!(!allowed, "a CID outside the list must be refused");
+        assert!(
+            reason.contains("2147121846"),
+            "reason should name the offending CID: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_allow_list_rejects_empty_cid_when_restricted() {
+        // An empty CID resolves to config.ads.customer_id in practice, but if
+        // that is also unset we must refuse rather than fall through to the
+        // API with an empty target.
+        let config = SafetyConfig {
+            allowed_customer_ids: vec!["8496152956".to_string()],
+            ..SafetyConfig::default()
+        };
+        let (allowed, _) = config.customer_allowed("");
+        assert!(!allowed);
+    }
+
+    #[test]
+    fn test_allow_list_loads_and_normalises_from_env() {
+        std::env::set_var("GOOGLE_ADS_ALLOWED_CIDS", "214-712-1846, 8496152956");
+        let config = Config::load().unwrap();
+        assert_eq!(
+            config.safety.allowed_customer_ids,
+            vec!["2147121846".to_string(), "8496152956".to_string()]
+        );
+        std::env::remove_var("GOOGLE_ADS_ALLOWED_CIDS");
+    }
+
+    #[test]
+    fn test_allow_list_empty_env_stays_unrestricted() {
+        std::env::remove_var("GOOGLE_ADS_ALLOWED_CIDS");
+        let config = Config::load().unwrap();
+        assert!(config.safety.allowed_customer_ids.is_empty());
+        assert!(config.safety.customer_allowed("123-456-7890").0);
+    }
+
+    #[test]
+    fn test_allow_list_skips_non_numeric_entries() {
+        std::env::set_var("GOOGLE_ADS_ALLOWED_CIDS", "849-615-2956, garbage");
+        let config = Config::load().unwrap();
+        assert_eq!(
+            config.safety.allowed_customer_ids,
+            vec!["8496152956".to_string()]
+        );
+        std::env::remove_var("GOOGLE_ADS_ALLOWED_CIDS");
     }
 
     #[test]
@@ -267,6 +441,28 @@ mod tests {
         std::env::remove_var("GOOGLE_ADS_CREDENTIALS_PATH");
         std::env::remove_var("GOOGLE_ADS_TOKEN_PATH");
         std::env::remove_var("GOOGLE_ADS_AUDIT_LOG");
+    }
+
+    #[test]
+    fn test_plan_store_dir_defaults_and_env_override() {
+        std::env::remove_var("GOOGLE_ADS_PLAN_STORE_DIR");
+        let config = Config::load().unwrap();
+        assert!(
+            config
+                .safety
+                .plan_store_dir
+                .to_string_lossy()
+                .contains(".mcp-google-ads"),
+            "default plan store dir should live under ~/.mcp-google-ads"
+        );
+
+        std::env::set_var("GOOGLE_ADS_PLAN_STORE_DIR", "/tmp/gads-plans-test");
+        let config = Config::load().unwrap();
+        assert_eq!(
+            config.safety.plan_store_dir,
+            PathBuf::from("/tmp/gads-plans-test")
+        );
+        std::env::remove_var("GOOGLE_ADS_PLAN_STORE_DIR");
     }
 
     #[test]

@@ -30,6 +30,12 @@ pub fn test_config() -> Config {
             require_dry_run: false,
             log_file: PathBuf::from("/tmp/__test_audit__.log"),
             blocked_operations: Vec::new(),
+            // Isolated per test run so drafts never leak between test files.
+            plan_store_dir: PathBuf::from("/tmp/__test_plan_store__"),
+            // Unrestricted, so existing tests keep exercising the paths they
+            // did before the allow-list existed. Tests that need the guard
+            // active set this explicitly.
+            allowed_customer_ids: Vec::new(),
         },
         read_only: false,
     }
