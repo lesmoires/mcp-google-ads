@@ -1,7 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
+
+// `Duration` is only referenced from the test module below; importing it
+// unconditionally trips `-D unused-imports` in a normal build.
+#[cfg(test)]
+use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -170,9 +175,9 @@ const DEFAULT_PLAN_TTL_SECS: i64 = 15 * 60;
 /// change while the server runs.
 static PLAN_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// Per-thread override used by tests so each test gets an isolated directory
-/// without disturbing other tests running concurrently in the same process.
-/// Production code never sets this, so runtime behaviour is unaffected.
+// Per-thread override used by tests so each test gets an isolated directory
+// without disturbing other tests running concurrently in the same process.
+// Production code never sets this, so runtime behaviour is unaffected.
 thread_local! {
     static PLAN_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
@@ -407,7 +412,10 @@ fn prune_applied_excluding(keep: &str) {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
         if stem == keep {
             continue;
         }
@@ -513,7 +521,10 @@ mod tests {
         let plan = make_plan();
         let plan_id = plan.plan_id.clone();
         store_plan(plan);
-        assert!(dir.join("pending").join(format!("{}.json", plan_id)).exists());
+        assert!(dir
+            .join("pending")
+            .join(format!("{}.json", plan_id))
+            .exists());
         // Drop any cached handle and re-resolve the directory from scratch,
         // the way a freshly spawned server process would.
         set_plan_store_override(dir.clone());
@@ -530,9 +541,14 @@ mod tests {
         plan.created_at = (Utc::now() - Duration::hours(2)).to_rfc3339();
         store_plan(plan);
 
-        assert!(get_plan(&plan_id).is_none(), "expired plan must not resolve");
         assert!(
-            !dir.join("pending").join(format!("{}.json", plan_id)).exists(),
+            get_plan(&plan_id).is_none(),
+            "expired plan must not resolve"
+        );
+        assert!(
+            !dir.join("pending")
+                .join(format!("{}.json", plan_id))
+                .exists(),
             "expired plan must be pruned from disk"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -585,13 +601,19 @@ mod tests {
         store_plan(plan);
 
         let claimed = claim_plan(&plan_id).expect("claim");
-        assert!(get_plan(&plan_id).is_none(), "claimed plans are not pending");
+        assert!(
+            get_plan(&plan_id).is_none(),
+            "claimed plans are not pending"
+        );
 
         restore_plan(&claimed);
 
         let recovered = get_plan(&plan_id).expect("plan must be retryable again");
         assert_eq!(recovered.plan_id, plan_id);
-        assert!(get_claimed_plan(&plan_id).is_none(), "release must clear the applied record");
+        assert!(
+            get_claimed_plan(&plan_id).is_none(),
+            "release must clear the applied record"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -606,7 +628,10 @@ mod tests {
                 ..make_plan()
             });
             assert!(
-                !store_root().join("pending").join(format!("{}.json", bad)).exists(),
+                !store_root()
+                    .join("pending")
+                    .join(format!("{}.json", bad))
+                    .exists(),
                 "must not write outside the store for {bad:?}"
             );
         }
